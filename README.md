@@ -70,31 +70,25 @@ curl http://localhost:6441/livez
 ## Develop locally without Docker
 
 ```bash
-# Python venv
-python3.11 -m venv .venv && source .venv/bin/activate
+# Install Poetry 1.8.3 if you don't have it
+pipx install poetry==1.8.3  # or: pip install --user poetry==1.8.3
 
-# Install vendored shared lib + service deps
-pip install -e libs/python-common
-pip install fastapi 'uvicorn[standard]' sqlalchemy asyncpg 'psycopg[binary]' \
-  alembic httpx pydantic pydantic-settings structlog tenacity cryptography \
-  redis google-cloud-pubsub \
-  opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp \
-  opentelemetry-instrumentation-fastapi opentelemetry-instrumentation-sqlalchemy
+# Install all deps (including the vendored eligibility-common lib) into a managed venv
+poetry install
 
 # Configure
 export $(cat .env | xargs)
 
 # Run
-PYTHONPATH=.:libs/python-common/src python -m app.main
+PYTHONPATH=.:libs/python-common/src poetry run python -m app.main
 ```
 
 ## Test
 
 ```bash
-pip install pytest pytest-asyncio
 PYTHONPATH=.:libs/python-common/src \
   DATABASE_URL=postgresql+psycopg://x@x/x \
-  python -m pytest tests -q
+  poetry run pytest tests -q
 ```
 
 ## Project layout (hexagonal)
