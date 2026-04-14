@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any
 
+import asyncio
 import strawberry
 from eligibility_common.logging import get_logger
 
@@ -89,6 +90,32 @@ class PlanSummary:
     name: str
     type: str
     metal_level: str | None
+
+
+@strawberry.type
+class Payer:
+    id: strawberry.ID
+    name: str
+
+
+@strawberry.type
+class Subgroup:
+    id: strawberry.ID
+    employer_id: strawberry.ID
+    name: str
+
+
+@strawberry.type
+class GroupAdminView:
+    """One row in the Groups admin page — employer + nested subgroups + visible plans."""
+
+    id: strawberry.ID
+    name: str
+    external_id: str | None
+    payer_id: strawberry.ID | None
+    payer_name: str | None
+    subgroups: list[Subgroup]
+    visible_plan_ids: list[strawberry.ID]
 
 
 @strawberry.type
@@ -297,6 +324,66 @@ class Query:
         ]
 
     @strawberry.field
+    async def payers(self) -> list[Payer]:
+        try:
+            r = await clients.group_client.get("/payers")
+            r.raise_for_status()
+            items = r.json()
+        except Exception as e:
+            log.warning("bff.payers.error", error=str(e))
+            return []
+        return [Payer(id=strawberry.ID(str(it["id"])), name=it["name"]) for it in items]
+
+    @strawberry.field
+    async def group_admin(self) -> list[GroupAdminView]:
+        """Aggregated view for the Groups admin page: each employer + its
+        subgroups + visible plans, plus the parent payer's name."""
+        # Pull all in parallel
+        try:
+            payers_r, employers_r = await asyncio.gather(
+                clients.group_client.get("/payers"),
+                clients.group_client.get("/employers", params={"name": "%"}),
+            )
+            payers_r.raise_for_status()
+            employers_r.raise_for_status()
+            payer_map = {p["id"]: p["name"] for p in payers_r.json()}
+            employers = employers_r.json()
+        except Exception as e:
+            log.warning("bff.group_admin.error", error=str(e))
+            return []
+
+        async def hydrate(emp: dict) -> GroupAdminView:
+            try:
+                sg_r, vis_r = await asyncio.gather(
+                    clients.group_client.get(f"/employers/{emp['id']}/subgroups"),
+                    clients.group_client.get(f"/employers/{emp['id']}/plans"),
+                )
+                sg_r.raise_for_status()
+                vis_r.raise_for_status()
+                subgroups = [
+                    Subgroup(
+                        id=strawberry.ID(str(sg["id"])),
+                        employer_id=strawberry.ID(str(sg["employer_id"])),
+                        name=sg["name"],
+                    )
+                    for sg in sg_r.json()
+                ]
+                visible = [strawberry.ID(str(pid)) for pid in vis_r.json().get("plan_ids", [])]
+            except Exception:
+                subgroups, visible = [], []
+            return GroupAdminView(
+                id=strawberry.ID(str(emp["id"])),
+                name=emp["name"],
+                external_id=emp.get("external_id"),
+                payer_id=strawberry.ID(str(emp["payer_id"])) if emp.get("payer_id") else None,
+                payer_name=payer_map.get(emp["payer_id"]),
+                subgroups=subgroups,
+                visible_plan_ids=visible,
+            )
+
+        return list(await asyncio.gather(*[hydrate(emp) for emp in employers]))
+
+    @strawberry.field
     async def employers(self, search: str | None = None) -> list[EmployerSummary]:
         # No search → return all employers (small list — payers × employers).
         params = {"name": search} if search else {"name": "%"}
@@ -435,6 +522,72 @@ class Mutation:
         r = await clients.member_client.post(f"/members/{member_id}/dependents", json=body)
         r.raise_for_status()
         return strawberry.ID(str(r.json()["id"]))
+
+    # ─── Group admin (bonus task — payer / employer / subgroup CRUD) ───
+    @strawberry.mutation
+    async def create_payer(self, name: str) -> Payer:
+        r = await clients.group_client.post("/payers", json={"name": name})
+        r.raise_for_status()
+        d = r.json()
+        return Payer(id=strawberry.ID(str(d["id"])), name=d["name"])
+
+    @strawberry.mutation
+    async def create_employer(
+        self, payer_id: strawberry.ID, name: str, external_id: str | None = None
+    ) -> EmployerSummary:
+        r = await clients.group_client.post(
+            "/employers",
+            json={"payer_id": str(payer_id), "name": name, "external_id": external_id},
+        )
+        r.raise_for_status()
+        d = r.json()
+        return EmployerSummary(
+            id=strawberry.ID(str(d["id"])),
+            name=d["name"],
+            external_id=d.get("external_id"),
+            payer_id=strawberry.ID(str(d["payer_id"])),
+        )
+
+    @strawberry.mutation
+    async def delete_employer(self, employer_id: strawberry.ID) -> bool:
+        r = await clients.group_client.delete(f"/employers/{employer_id}")
+        return r.status_code in (200, 204)
+
+    @strawberry.mutation
+    async def create_subgroup(self, employer_id: strawberry.ID, name: str) -> Subgroup:
+        r = await clients.group_client.post(
+            "/subgroups", json={"employer_id": str(employer_id), "name": name}
+        )
+        r.raise_for_status()
+        d = r.json()
+        return Subgroup(
+            id=strawberry.ID(str(d["id"])),
+            employer_id=strawberry.ID(str(d["employer_id"])),
+            name=d["name"],
+        )
+
+    @strawberry.mutation
+    async def delete_subgroup(self, subgroup_id: strawberry.ID) -> bool:
+        r = await clients.group_client.delete(f"/subgroups/{subgroup_id}")
+        return r.status_code in (200, 204)
+
+    @strawberry.mutation
+    async def attach_plan(self, employer_id: strawberry.ID, plan_id: strawberry.ID) -> bool:
+        r = await clients.group_client.post(
+            "/visibility",
+            json={"employer_id": str(employer_id), "plan_id": str(plan_id), "action": "attach"},
+        )
+        r.raise_for_status()
+        return bool(r.json().get("changed"))
+
+    @strawberry.mutation
+    async def detach_plan(self, employer_id: strawberry.ID, plan_id: strawberry.ID) -> bool:
+        r = await clients.group_client.post(
+            "/visibility",
+            json={"employer_id": str(employer_id), "plan_id": str(plan_id), "action": "detach"},
+        )
+        r.raise_for_status()
+        return bool(r.json().get("changed"))
 
     @strawberry.mutation
     async def replay_file(self, file_id: strawberry.ID) -> bool:
