@@ -505,6 +505,47 @@ class Mutation:
         return [strawberry.ID(str(eid)) for eid in data.get("enrollment_ids", [])]
 
     @strawberry.mutation
+    async def change_enrollment_plan(
+        self,
+        member_id: strawberry.ID,
+        old_plan_id: strawberry.ID,
+        new_plan_id: strawberry.ID,
+        employer_id: strawberry.ID,
+        new_valid_from: date,
+        relationship: str = "subscriber",
+    ) -> strawberry.ID:
+        """Plan change = TERMINATE old (day before new effective) + ADD new.
+        Bitemporal-correct: closes the in-force segment, opens a new one."""
+        from datetime import timedelta as _td
+        tenant = settings.tenant_default
+        # 1. Close the old enrollment
+        valid_to_old = new_valid_from - _td(days=1)
+        try:
+            tr = await clients.atlas_client.post("/commands", json={
+                "command_type": "TERMINATE",
+                "tenant_id": tenant,
+                "member_id": str(member_id),
+                "plan_id": str(old_plan_id),
+                "valid_to": valid_to_old.isoformat(),
+            })
+            tr.raise_for_status()
+        except Exception as e:
+            log.warning("bff.change_plan.terminate_failed", error=str(e))
+        # 2. Open new enrollment with new plan
+        ar = await clients.atlas_client.post("/commands", json={
+            "command_type": "ADD",
+            "tenant_id": tenant,
+            "employer_id": str(employer_id),
+            "plan_id": str(new_plan_id),
+            "member_id": str(member_id),
+            "relationship": relationship,
+            "valid_from": new_valid_from.isoformat(),
+        })
+        ar.raise_for_status()
+        eids = ar.json().get("enrollment_ids", [])
+        return strawberry.ID(str(eids[0]) if eids else "")
+
+    @strawberry.mutation
     async def add_dependent(
         self,
         member_id: strawberry.ID,
