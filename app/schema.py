@@ -83,6 +83,15 @@ class EmployerSummary:
 
 
 @strawberry.type
+class PlanSummary:
+    id: strawberry.ID
+    plan_code: str
+    name: str
+    type: str
+    metal_level: str | None
+
+
+@strawberry.type
 class SearchResult:
     items: list[Enrollment]
     total: int
@@ -267,11 +276,32 @@ class Query:
         )
 
     @strawberry.field
-    async def employers(self, search: str | None = None) -> list[EmployerSummary]:
-        if not search:
-            return []
+    async def plans(self) -> list[PlanSummary]:
+        """List all plans available in the catalog."""
         try:
-            r = await clients.group_client.get("/employers", params={"name": search})
+            r = await clients.plan_client.get("/plans")
+            r.raise_for_status()
+            items = r.json()
+        except Exception as e:
+            log.warning("bff.plans.error", error=str(e))
+            return []
+        return [
+            PlanSummary(
+                id=strawberry.ID(str(it["id"])),
+                plan_code=it.get("plan_code", ""),
+                name=it.get("name", ""),
+                type=it.get("type", ""),
+                metal_level=it.get("metal_level"),
+            )
+            for it in items
+        ]
+
+    @strawberry.field
+    async def employers(self, search: str | None = None) -> list[EmployerSummary]:
+        # No search → return all employers (small list — payers × employers).
+        params = {"name": search} if search else {"name": "%"}
+        try:
+            r = await clients.group_client.get("/employers", params=params)
             r.raise_for_status()
             items = r.json()
         except Exception as e:
@@ -292,7 +322,75 @@ class Query:
 
 
 @strawberry.type
+class AddMemberResult:
+    member_id: strawberry.ID
+    enrollment_id: strawberry.ID
+    member_name: str
+
+
+@strawberry.input
+class AddMemberInput:
+    first_name: str
+    last_name: str
+    dob: date
+    gender: str | None = None
+    card_number: str | None = None
+    ssn_last4: str | None = None
+    employer_id: strawberry.ID
+    subgroup_name: str | None = None
+    plan_id: strawberry.ID
+    relationship: str = "subscriber"
+    effective_date: date
+
+
+@strawberry.type
 class Mutation:
+    @strawberry.mutation
+    async def add_member(self, input: AddMemberInput) -> AddMemberResult:
+        """Orchestrate: POST /members on member svc → POST /commands ADD on atlas.
+
+        This is the BFF doing what saga-orchestration would do in prod — it
+        keeps the frontend simple (one round-trip) and lets the BFF apply
+        idempotency keys, retries, and error envelope consistently.
+        """
+        tenant = settings.tenant_default
+        member_body = {
+            "tenant_id": tenant,
+            "employer_id": str(input.employer_id),
+            "first_name": input.first_name.strip().upper(),
+            "last_name": input.last_name.strip().upper(),
+            "dob": input.dob.isoformat(),
+            "gender": input.gender,
+            "card_number": input.card_number,
+            # member svc expects full SSN; we forward whatever the form gave us.
+            # The svc encrypts + extracts last4 server-side.
+            "ssn": input.ssn_last4,
+        }
+        member_body = {k: v for k, v in member_body.items() if v is not None}
+        mr = await clients.member_client.post("/members", json=member_body)
+        mr.raise_for_status()
+        member = mr.json()
+
+        cmd_body = {
+            "command_type": "ADD",
+            "tenant_id": tenant,
+            "employer_id": str(input.employer_id),
+            "subgroup_name": input.subgroup_name,
+            "plan_id": str(input.plan_id),
+            "member_id": member["id"],
+            "relationship": input.relationship,
+            "valid_from": input.effective_date.isoformat(),
+        }
+        ar = await clients.atlas_client.post("/commands", json=cmd_body)
+        ar.raise_for_status()
+        atlas_resp = ar.json()
+        eids = atlas_resp.get("enrollment_ids", [])
+        return AddMemberResult(
+            member_id=strawberry.ID(str(member["id"])),
+            enrollment_id=strawberry.ID(str(eids[0]) if eids else ""),
+            member_name=f"{input.first_name.upper()} {input.last_name.upper()}",
+        )
+
     @strawberry.mutation
     async def terminate_enrollment(
         self,
