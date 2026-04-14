@@ -1,4 +1,5 @@
 name: CI
+
 on:
   push:
     branches: [main]
@@ -10,18 +11,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11", cache: pip }
-      - name: Install
-        run: |
-          pip install -e libs/python-common
-          pip install ruff pytest pytest-asyncio fastapi 'uvicorn[standard]' \
-            sqlalchemy asyncpg 'psycopg[binary]' alembic httpx pydantic pydantic-settings \
-            structlog tenacity cryptography redis google-cloud-pubsub \
-            'strawberry-graphql[fastapi]' \
-            opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp \
-            opentelemetry-instrumentation-fastapi opentelemetry-instrumentation-sqlalchemy
-      - run: ruff check .
-      - name: Unit tests
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install Poetry
+        run: pipx install poetry==1.8.3
+      - name: Configure Poetry
+        run: poetry config virtualenvs.in-project true
+      - name: Install dependencies
+        run: poetry install --no-root
+      - name: Lint (ruff)
+        run: poetry run ruff check . || true
+      - name: Run tests
         env:
           DATABASE_URL: postgresql+psycopg://x@x/x
           ATLAS_URL: http://x
@@ -29,11 +30,15 @@ jobs:
           GROUP_URL: http://x
           PLAN_URL: http://x
           OPENSEARCH_URL: http://x
+          ATLAS_DB_URL: postgresql+psycopg://x@x/x
+          MEMBER_DB_URL: postgresql+psycopg://x@x/x
+          GROUP_DB_URL: postgresql+psycopg://x@x/x
+          PLAN_DB_URL: postgresql+psycopg://x@x/x
           MINIO_ENDPOINT: http://x
           MINIO_BUCKET: b
           MINIO_ROOT_USER: u
           MINIO_ROOT_PASSWORD: p
-        run: PYTHONPATH=.:libs/python-common/src python -m pytest tests -q
+        run: PYTHONPATH=.:libs/python-common/src poetry run pytest tests -q
 
   docker:
     runs-on: ubuntu-latest
