@@ -505,6 +505,42 @@ class Mutation:
         return [strawberry.ID(str(eid)) for eid in data.get("enrollment_ids", [])]
 
     @strawberry.mutation
+    async def update_member_demographics(
+        self,
+        member_id: strawberry.ID,
+        first_name: str | None = None,
+        last_name: str | None = None,
+        dob: date | None = None,
+        gender: str | None = None,
+    ) -> bool:
+        """Update member demographics via member svc POST /members (upsert by card).
+        Emits MemberUpserted so the projector refreshes the denormalized view."""
+        try:
+            r = await clients.member_client.get(f"/members/{member_id}")
+            r.raise_for_status()
+            existing = r.json()
+        except Exception as e:
+            log.warning("bff.update_member.lookup_failed", error=str(e))
+            return False
+        body: dict[str, Any] = {
+            "tenant_id": existing["tenant_id"],
+            "employer_id": existing["employer_id"],
+            "first_name": (first_name or existing["first_name"] or "").strip().upper(),
+            "last_name": (last_name or existing["last_name"] or "").strip().upper(),
+            "dob": (dob.isoformat() if dob else existing["dob"]),
+            "gender": gender if gender is not None else existing.get("gender"),
+            "card_number": existing.get("card_number"),
+        }
+        body = {k: v for k, v in body.items() if v is not None}
+        try:
+            ur = await clients.member_client.post("/members", json=body)
+            ur.raise_for_status()
+            return True
+        except Exception as e:
+            log.warning("bff.update_member.upsert_failed", error=str(e))
+            return False
+
+    @strawberry.mutation
     async def change_enrollment_plan(
         self,
         member_id: strawberry.ID,
