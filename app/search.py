@@ -275,14 +275,37 @@ async def find_by_card(card_number: str) -> dict[str, Any] | None:
 async def timeline_for_member(
     member_id: str, tenant_id: str, as_of: datetime | None = None
 ) -> list[dict[str, Any]]:
-    """Delegate to atlas — it's the source of truth for bitemporal segments."""
-    from app.clients import atlas_client
+    """Delegate to atlas — it's the source of truth for bitemporal segments —
+    then hydrate ``plan_name`` via the plan service so the UI can render
+    readable bar labels without a second round-trip."""
+    from app.clients import atlas_client, plan_client
 
     headers = {"X-Tenant-Id": tenant_id}
     try:
         r = await atlas_client.get(f"/members/{member_id}/timeline", headers=headers)
         r.raise_for_status()
-        return r.json().get("segments", [])
+        segments = r.json().get("segments", [])
     except Exception as e:
         log.warning("bff.timeline.error", error=str(e))
         return []
+
+    # Batch-resolve unique plan_ids in one plan-svc call; fall back to blank
+    # plan_name if lookup fails (frontend already tolerates nulls).
+    plan_ids = {s["plan_id"] for s in segments if s.get("plan_id")}
+    name_by_id: dict[str, str] = {}
+    if plan_ids:
+        try:
+            pr = await plan_client.get("/plans")
+            pr.raise_for_status()
+            for p in pr.json():
+                pid = str(p.get("id"))
+                if pid in plan_ids:
+                    name_by_id[pid] = p.get("name") or p.get("plan_code") or ""
+        except Exception as e:
+            log.warning("bff.timeline.plan_enrich_failed", error=str(e))
+
+    for seg in segments:
+        pid = str(seg.get("plan_id", ""))
+        if pid in name_by_id:
+            seg["plan_name"] = name_by_id[pid]
+    return segments
