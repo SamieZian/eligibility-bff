@@ -7,14 +7,22 @@ atlas's job — but it owns the GraphQL contract the frontend speaks.
 """
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
 from datetime import date, datetime
 from typing import Any
 
 import asyncio
 import strawberry
 from eligibility_common.logging import get_logger
+from strawberry.types import Info
 
 from app import clients, search
+from app.graphql_extensions import (
+    ErrorEnvelopeExtension,
+    GroupAdminLoaders,
+    depth_limit_extension,
+)
+from app.pubsub_bridge import subscribe_enrollment_updates
 from app.settings import settings
 
 log = get_logger(__name__)
@@ -335,9 +343,16 @@ class Query:
         return [Payer(id=strawberry.ID(str(it["id"])), name=it["name"]) for it in items]
 
     @strawberry.field
-    async def group_admin(self) -> list[GroupAdminView]:
+    async def group_admin(self, info: Info) -> list[GroupAdminView]:
         """Aggregated view for the Groups admin page: each employer + its
-        subgroups + visible plans, plus the parent payer's name."""
+        subgroups + visible plans, plus the parent payer's name.
+
+        Uses per-request DataLoaders (see ``app.graphql_extensions``) so that
+        duplicate employer ids collapse to a single HTTP call and the overall
+        fan-out is capped by an ``asyncio.Semaphore`` inside the loader. The
+        two top-level calls (``/payers``, ``/employers``) plus the loaders give
+        us 2 + 2·N unique-employer HTTP calls instead of 2 + 2·N-with-dupes.
+        """
         # Pull all in parallel
         try:
             payers_r, employers_r = await asyncio.gather(
@@ -352,36 +367,43 @@ class Query:
             log.warning("bff.group_admin.error", error=str(e))
             return []
 
-        async def hydrate(emp: dict) -> GroupAdminView:
-            try:
-                sg_r, vis_r = await asyncio.gather(
-                    clients.group_client.get(f"/employers/{emp['id']}/subgroups"),
-                    clients.group_client.get(f"/employers/{emp['id']}/plans"),
-                )
-                sg_r.raise_for_status()
-                vis_r.raise_for_status()
-                subgroups = [
-                    Subgroup(
-                        id=strawberry.ID(str(sg["id"])),
-                        employer_id=strawberry.ID(str(sg["employer_id"])),
-                        name=sg["name"],
-                    )
-                    for sg in sg_r.json()
-                ]
-                visible = [strawberry.ID(str(pid)) for pid in vis_r.json().get("plan_ids", [])]
-            except Exception:
-                subgroups, visible = [], []
-            return GroupAdminView(
-                id=strawberry.ID(str(emp["id"])),
-                name=emp["name"],
-                external_id=emp.get("external_id"),
-                payer_id=strawberry.ID(str(emp["payer_id"])) if emp.get("payer_id") else None,
-                payer_name=payer_map.get(emp["payer_id"]),
-                subgroups=subgroups,
-                visible_plan_ids=visible,
-            )
+        loaders: GroupAdminLoaders | None = (info.context or {}).get("loaders")  # type: ignore[assignment]
+        if loaders is None:
+            # Defensive: should never happen once the router wires context,
+            # but keeps the resolver usable from tests / direct execute().
+            from app.graphql_extensions import build_loaders
 
-        return list(await asyncio.gather(*[hydrate(emp) for emp in employers]))
+            loaders = build_loaders(clients.group_client)
+
+        employer_ids = [str(emp["id"]) for emp in employers]
+        subgroup_lists, plan_lists = await asyncio.gather(
+            loaders.subgroups.load_many(employer_ids),
+            loaders.visible_plans.load_many(employer_ids),
+        )
+
+        out: list[GroupAdminView] = []
+        for emp, subgroups_raw, plan_ids in zip(employers, subgroup_lists, plan_lists):
+            subgroups = [
+                Subgroup(
+                    id=strawberry.ID(str(sg["id"])),
+                    employer_id=strawberry.ID(str(sg["employer_id"])),
+                    name=sg["name"],
+                )
+                for sg in (subgroups_raw or [])
+            ]
+            visible = [strawberry.ID(str(pid)) for pid in (plan_ids or [])]
+            out.append(
+                GroupAdminView(
+                    id=strawberry.ID(str(emp["id"])),
+                    name=emp["name"],
+                    external_id=emp.get("external_id"),
+                    payer_id=strawberry.ID(str(emp["payer_id"])) if emp.get("payer_id") else None,
+                    payer_name=payer_map.get(emp["payer_id"]),
+                    subgroups=subgroups,
+                    visible_plan_ids=visible,
+                )
+            )
+        return out
 
     @strawberry.field
     async def employers(self, search: str | None = None) -> list[EmployerSummary]:
@@ -515,8 +537,11 @@ class Mutation:
     ) -> bool:
         """Update member demographics via member svc POST /members (upsert by card).
         Emits MemberUpserted so the projector refreshes the denormalized view."""
+        tenant_header = {"X-Tenant-Id": settings.tenant_default}
         try:
-            r = await clients.member_client.get(f"/members/{member_id}")
+            r = await clients.member_client.get(
+                f"/members/{member_id}", headers=tenant_header
+            )
             r.raise_for_status()
             existing = r.json()
         except Exception as e:
@@ -712,4 +737,50 @@ class Mutation:
             return False
 
 
-schema = strawberry.Schema(query=Query, mutation=Mutation)
+# ─────────────────────────── Subscription root ────────────────────────────────
+
+
+@strawberry.type
+class EnrollmentUpdate:
+    """A slim event payload describing a change that impacts a member's
+    timeline. Enough for the frontend to decide whether to invalidate its
+    TanStack Query cache for the open Member Detail drawer."""
+
+    member_id: strawberry.ID
+    event_type: str  # "MemberUpserted" | "EnrollmentAdded" | "EnrollmentTerminated" | "EnrollmentChanged"
+    occurred_at: datetime
+
+
+@strawberry.type
+class Subscription:
+    @strawberry.subscription
+    async def enrollment_updated(
+        self, member_id: strawberry.ID
+    ) -> AsyncGenerator[EnrollmentUpdate, None]:
+        """Stream events for a specific member. Closes on client disconnect."""
+        async for evt in subscribe_enrollment_updates(str(member_id)):
+            occurred_raw = evt.get("occurred_at")
+            try:
+                occurred = (
+                    datetime.fromisoformat(occurred_raw)
+                    if occurred_raw
+                    else datetime.utcnow()
+                )
+            except (TypeError, ValueError):
+                occurred = datetime.utcnow()
+            yield EnrollmentUpdate(
+                member_id=strawberry.ID(str(evt.get("member_id", ""))),
+                event_type=str(evt.get("event_type", "Unknown")),
+                occurred_at=occurred,
+            )
+
+
+schema = strawberry.Schema(
+    query=Query,
+    mutation=Mutation,
+    subscription=Subscription,
+    extensions=[
+        ErrorEnvelopeExtension,
+        depth_limit_extension(),
+    ],
+)

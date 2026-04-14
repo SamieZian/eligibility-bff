@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from typing import Any
 
 import uvicorn
 from eligibility_common.app_factory import create_app
 from fastapi import FastAPI
 from sqlalchemy import text
 from strawberry.fastapi import GraphQLRouter
+from strawberry.subscriptions import (
+    GRAPHQL_TRANSPORT_WS_PROTOCOL,
+    GRAPHQL_WS_PROTOCOL,
+)
 
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import clients
+from app.graphql_extensions import build_loaders
 from app.schema import schema
 from app.search import _engine
 from app.settings import settings
@@ -50,17 +56,37 @@ app = create_app(
     readiness={"self": _ping_downstreams},
 )
 
-# Browser dev origins. In prod, use a strict allowlist or behind same-origin proxy.
+# CORS origins come from the CORS_ALLOW_ORIGINS env var (see app.settings).
+# Defaults to local dev hosts only; prod MUST set the env to its public origin(s).
+# Wildcard "*" is rejected in settings because credentialed requests can't use it.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173", "http://localhost:4000"],
+    allow_origins=settings.cors_origins_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["X-Correlation-Id"],
 )
 
-graphql_app: GraphQLRouter = GraphQLRouter(schema)
+
+async def _graphql_context() -> dict[str, Any]:
+    """Build a fresh GraphQL context for every incoming request.
+
+    Crucially we instantiate new DataLoaders per-request — their batching +
+    caching is scoped to the life of a single GraphQL operation, so sharing
+    loaders across requests would leak data between users.
+    """
+    return {"loaders": build_loaders(clients.group_client)}
+
+
+graphql_app: GraphQLRouter = GraphQLRouter(
+    schema,
+    context_getter=_graphql_context,
+    subscription_protocols=[
+        GRAPHQL_TRANSPORT_WS_PROTOCOL,
+        GRAPHQL_WS_PROTOCOL,
+    ],
+)
 app.include_router(graphql_app, prefix="/graphql")
 app.include_router(upload_router)
 
