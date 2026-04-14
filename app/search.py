@@ -87,6 +87,14 @@ def _decode_cursor(cursor: str) -> tuple[date, str] | None:
 def _where_clauses(f: _Filters) -> tuple[list[str], dict[str, Any]]:
     where: list[str] = []
     params: dict[str, Any] = {}
+    # Free-text fallback when OS isn't filtering for us — broad ILIKE across the
+    # likely-searched fields. Cheap because the trigram GIN index covers member_name.
+    if f.q:
+        where.append(
+            "(member_name ILIKE :q_like OR card_number ILIKE :q_like "
+            "OR first_name ILIKE :q_like OR last_name ILIKE :q_like)"
+        )
+        params["q_like"] = f"%{f.q}%"
     if f.card_number:
         where.append("card_number = :card_number")
         params["card_number"] = f.card_number
@@ -225,7 +233,7 @@ async def _opensearch_ids(f: _Filters, limit: int) -> list[str] | None:
         "_source": ["enrollment_id"],
         "query": {"bool": {"must": must, "filter": filter_terms}},
     }
-    url = f"{settings.opensearch_url}/eligibility_view/_search"
+    url = f"{settings.opensearch_url}/eligibility/_search"
     try:
         async with httpx.AsyncClient(timeout=2.0) as c:
             r = await c.post(url, json=body)

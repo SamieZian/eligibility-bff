@@ -8,6 +8,8 @@ from fastapi import FastAPI
 from sqlalchemy import text
 from strawberry.fastapi import GraphQLRouter
 
+from fastapi.middleware.cors import CORSMiddleware
+
 from app import clients
 from app.schema import schema
 from app.search import _engine
@@ -46,6 +48,16 @@ app = create_app(
     service_name=settings.service_name,
     lifespan=lifespan,
     readiness={"self": _ping_downstreams},
+)
+
+# Browser dev origins. In prod, use a strict allowlist or behind same-origin proxy.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://localhost:5173", "http://localhost:4000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["X-Correlation-Id"],
 )
 
 graphql_app: GraphQLRouter = GraphQLRouter(schema)
