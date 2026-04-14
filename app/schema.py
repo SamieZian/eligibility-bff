@@ -28,6 +28,7 @@ class Enrollment:
     tenant_id: strawberry.ID
     employer_id: strawberry.ID
     employer_name: str | None
+    subgroup_name: str | None
     plan_id: strawberry.ID
     plan_name: str | None
     plan_code: str | None
@@ -128,6 +129,7 @@ def _row_to_enrollment(row: dict[str, Any]) -> Enrollment:
         tenant_id=strawberry.ID(str(row["tenant_id"])),
         employer_id=strawberry.ID(str(row["employer_id"])),
         employer_name=row.get("employer_name"),
+        subgroup_name=row.get("subgroup_name"),
         plan_id=strawberry.ID(str(row["plan_id"])),
         plan_name=row.get("plan_name"),
         plan_code=row.get("plan_code"),

@@ -29,9 +29,10 @@ log = get_logger(__name__)
 # card_number, ssn_last4, relationship, status, effective_date,
 # termination_date, subgroup_id, subgroup_name
 _SELECT_COLS = (
-    "enrollment_id, tenant_id, employer_id, employer_name, plan_id, plan_name, "
-    "plan_code, member_id, member_name, first_name, last_name, dob, gender, "
-    "card_number, ssn_last4, relationship, status, effective_date, termination_date"
+    "enrollment_id, tenant_id, employer_id, employer_name, subgroup_name, "
+    "plan_id, plan_name, plan_code, member_id, member_name, first_name, last_name, "
+    "dob, gender, card_number, ssn_last4, relationship, status, "
+    "effective_date, termination_date"
 )
 
 _read_engine: AsyncEngine | None = None
