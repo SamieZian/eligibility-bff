@@ -79,14 +79,27 @@ async def _post(
     raise RuntimeError("unreachable")
 
 
+async def _get_or_create_payer(client: httpx.AsyncClient, name: str) -> dict[str, Any]:
+    """Look up an existing payer by name, create only if missing. Idempotent seed."""
+    try:
+        r = await client.get("/payers", timeout=10.0)
+        r.raise_for_status()
+        for p in r.json():
+            if p.get("name") == name:
+                return p
+    except httpx.HTTPError:
+        pass
+    return await _post(client, "/payers", {"name": name})
+
+
 async def seed() -> None:
     async with (
         httpx.AsyncClient(base_url=settings.group_url) as group,
         httpx.AsyncClient(base_url=settings.plan_url) as plan,
     ):
-        # Payers — API generates IDs; we capture them.
-        icici = await _post(group, "/payers", {"name": "ICICI"})
-        aetna = await _post(group, "/payers", {"name": "Aetna"})
+        # Payers — idempotent: reuse if already present.
+        icici = await _get_or_create_payer(group, "ICICI")
+        aetna = await _get_or_create_payer(group, "Aetna")
         # Employers — use returned payer IDs.
         swiggy = await _post(
             group,
