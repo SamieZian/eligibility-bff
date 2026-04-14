@@ -354,6 +354,13 @@ class Mutation:
         idempotency keys, retries, and error envelope consistently.
         """
         tenant = settings.tenant_default
+
+        # Auto-generate a Member ID Card when the caller didn't supply one.
+        # Pattern: payer-prefix `M` + 9-digit zero-padded random — matches
+        # what most real payer systems do (insurer-assigned card on enrollment).
+        import random as _random
+        card_number = (input.card_number or "").strip() or f"M{_random.randint(0, 999_999_999):09d}"
+
         member_body = {
             "tenant_id": tenant,
             "employer_id": str(input.employer_id),
@@ -361,7 +368,7 @@ class Mutation:
             "last_name": input.last_name.strip().upper(),
             "dob": input.dob.isoformat(),
             "gender": input.gender,
-            "card_number": input.card_number,
+            "card_number": card_number,
             # member svc expects full SSN; we forward whatever the form gave us.
             # The svc encrypts + extracts last4 server-side.
             "ssn": input.ssn_last4,

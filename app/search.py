@@ -252,12 +252,18 @@ async def search(
     cursor: str | None = None,
     sort: str = "effective_date_desc",
 ) -> tuple[list[dict[str, Any]], int, str | None]:
+    # When the caller provides free-text `q`, OpenSearch is consulted for
+    # fuzziness ranking. If OS returns hits → hydrate from pg. If OS returns
+    # nothing (e.g. projection lag for a just-added member) → fall through to
+    # pg's ILIKE fallback so the row is still findable.
     if f.q:
         ids = await _opensearch_ids(f, limit)
-        if ids is not None:
+        if ids:
+            # OS hits — hydrate full row data from pg
             return await _pg_search(f, limit, cursor, sort, enrollment_ids=ids)
-        # degrade: fall through to pg scan with other filters
-        log.info("bff.search.degraded_to_pg")
+        # OS returned empty OR was unreachable. Either way, pg has the q
+        # ILIKE fallback so we still find rows that haven't been indexed yet.
+        log.info("bff.search.os_empty_using_pg", q=f.q)
     return await _pg_search(f, limit, cursor, sort)
 
 
