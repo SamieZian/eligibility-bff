@@ -133,14 +133,134 @@ See `app/interfaces/api.py` for the route list. Standard endpoints:
 - `GET /livez` → liveness probe
 - `GET /readyz` → readiness probe (checks deps reachable)
 
+## Testing via curl
+
+BFF serves GraphQL at **`POST http://localhost:4000/graphql`** and a REST file-upload at `POST /files/eligibility`. The frontend is optional — reviewers can exercise every feature from the command line.
+
+```bash
+BFF=http://localhost:4000
+T=11111111-1111-1111-1111-111111111111
+H=(-H "Content-Type: application/json" -H "X-Tenant-Id: $T")
+```
+
+**Queries**
+
+```bash
+# 1. Fuzzy search (hits OpenSearch + hydrates from pg)
+curl -s -X POST $BFF/graphql "${H[@]}" -d '{
+  "query":"{ searchEnrollments(filter:{q:\"sharma\"}, page:{limit:5}) { total items { memberName employerName planName status } } }"
+}' | jq .
+
+# 2. Exact filter + pagination (server-side status chip)
+curl -s -X POST $BFF/graphql "${H[@]}" -d '{
+  "query":"{ searchEnrollments(filter:{status:\"active\"}, page:{limit:10}) { total items { memberName } nextCursor } }"
+}' | jq .
+
+# 3. Plans / Employers / Groups admin
+curl -s -X POST $BFF/graphql "${H[@]}" -d '{"query":"{ plans { id planCode name type } }"}' | jq .
+curl -s -X POST $BFF/graphql "${H[@]}" -d '{"query":"{ groupAdmin { id name subgroups { name } visiblePlanIds } }"}' | jq .
+
+# 4. Bitemporal timeline (plan names enriched)
+MID=...  # from (1)
+curl -s -X POST $BFF/graphql "${H[@]}" -d "{
+  \"query\":\"{ enrollmentTimeline(memberId: \\\"$MID\\\") { planName status validFrom validTo isInForce } }\"
+}" | jq .
+```
+
+**Mutations**
+
+```bash
+# Add member (orchestrated saga: POST /members → POST /commands)
+EMP=...; PLAN=...
+curl -s -X POST $BFF/graphql "${H[@]}" -d "{
+  \"query\":\"mutation(\$in: AddMemberInput!) { addMember(input: \$in) { memberId memberName } }\",
+  \"variables\":{\"in\":{
+    \"firstName\":\"DEMO\",\"lastName\":\"USER\",\"dob\":\"2000-01-01\",
+    \"employerId\":\"$EMP\",\"planId\":\"$PLAN\",
+    \"relationship\":\"subscriber\",\"effectiveDate\":\"2026-05-01\"
+  }}
+}" | jq .
+
+# Terminate
+curl -s -X POST $BFF/graphql "${H[@]}" -d "{
+  \"query\":\"mutation { terminateEnrollment(memberId: \\\"$MID\\\", planId: \\\"$PLAN\\\", validTo: \\\"2026-07-31\\\") }\"
+}" | jq .
+
+# Plan change saga (TERMINATE old + ADD new on the same effective date)
+curl -s -X POST $BFF/graphql "${H[@]}" -d "{
+  \"query\":\"mutation { changeEnrollmentPlan(memberId:\\\"$MID\\\", oldPlanId:\\\"$OLD\\\", newPlanId:\\\"$NEW\\\", employerId:\\\"$EMP\\\", newValidFrom:\\\"2026-07-01\\\") }\"
+}" | jq .
+
+# Demographics update (bumps version; triggers MemberUpserted → projector refresh)
+curl -s -X POST $BFF/graphql "${H[@]}" -d "{
+  \"query\":\"mutation { updateMemberDemographics(memberId:\\\"$MID\\\", lastName:\\\"SHARMA-PATEL\\\") }\"
+}" | jq .
+```
+
+**File upload** (REST multipart — same endpoint the Upload UI uses)
+
+```bash
+curl -s -X POST $BFF/files/eligibility \
+  -H "X-Tenant-Id: $T" -H "X-Correlation-Id: $(uuidgen)" \
+  -F "file=@samples/834_demo.x12" | jq .
+# → {"file_id": "...", "job_id": "...", "status": "UPLOADED"}
+```
+
+**GraphQL subscription** (WebSocket, `graphql-transport-ws`)
+
+```bash
+pip install websockets httpx
+python3 - <<'PY'
+import asyncio, json, websockets
+async def main():
+    async with websockets.connect("ws://localhost:4000/graphql",
+                                   subprotocols=["graphql-transport-ws"]) as ws:
+        await ws.send(json.dumps({"type":"connection_init","payload":{}}))
+        print(await ws.recv())
+        await ws.send(json.dumps({
+            "id":"1","type":"subscribe",
+            "payload":{"query":"subscription($m: ID!) { enrollmentUpdated(memberId: $m) { eventType occurredAt } }",
+                       "variables":{"m":"REPLACE_WITH_REAL_MEMBER_ID"}}
+        }))
+        while True: print(await ws.recv())
+asyncio.run(main())
+PY
+# Trigger any mutation on that member in another terminal → see the event stream in ~1s
+```
+
+**Error envelope** (GraphQL `extensions`)
+
+```json
+{
+  "errors": [{
+    "message": "Internal error",
+    "extensions": {
+      "code": "INTERNAL_ERROR",
+      "retryable": false,
+      "correlation_id": "test-1"
+    }
+  }]
+}
+```
+
+**Depth-limit test** (schema rejects queries deeper than 8):
+
+```bash
+curl -s -X POST $BFF/graphql "${H[@]}" -d '{
+  "query":"{ __schema { types { fields { type { fields { type { fields { type { fields { name } } } } } } } } } }"
+}' | jq .
+# → errors: "Query '<anonymous>' exceeds maximum depth of 8 (got 10)"
+```
+
 ## Patterns used
 
 - Hexagonal architecture (domain / application / infra / interfaces)
-- Transactional outbox for at-least-once event delivery
-- Idempotent commands (each command's effect is repeatable)
+- Strawberry GraphQL with custom extensions: **error envelope**, **DataLoader**, **AST depth-limit validator**
+- GraphQL subscriptions over WebSocket (`graphql-transport-ws` + `graphql-ws`)
 - Structured JSON logs with correlation ID propagation
-- OpenTelemetry traces (BFF → service → DB)
-- Circuit breakers on outbound HTTP
+- OpenTelemetry traces (browser → BFF → service → DB)
+- Circuit breakers + retry-with-jitter + deadline propagation on every downstream
+- CORS origin allow-list (rejects `*` with credentialed requests)
 
 ## License
 
